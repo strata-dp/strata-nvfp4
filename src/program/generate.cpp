@@ -154,7 +154,7 @@ namespace {
 // [claude] DP prompt path tunables: STRATA_DP_MIN (tokens from which a segment reads on both GPUs, default 16384),
 // STRATA_DP_PIPE_CHUNK (the layer pipeline's chunk for shorter segments, default 8192)
 int64_t dp_min_tokens() {
-    static const int64_t v = [] { const char* e = std::getenv("STRATA_DP_MIN"); return e ? std::max<int64_t>(4096, std::atoll(e)) : (int64_t) 16384; }();
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_DP_MIN"); return e ? std::max<int64_t>(4096, std::atoll(e)) : (int64_t) 8000; }();
     return v;
 }
 int64_t dp_pipe_chunk() {
