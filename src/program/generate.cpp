@@ -167,6 +167,25 @@ int64_t dp_step_for(int64_t n, int64_t cap) {
     if (k & 1) ++k;
     return ((n + k - 1) / k + 255) / 256 * 256;
 }
+// the shortest last chunk Prefill::run_dp takes: the drafter's window (--mtp-window 4096) and 64 positions before it,
+// on the 256 grid
+constexpr int64_t kDpMinLast = 4224;
+// a segment the DP plan takes (two or more balanced chunks, the last of at least kDpMinLast tokens); a shorter one is
+// read by the layer pipeline and must lend the pipeline's chunk, not the DP step (8K prompts lent two 4096-token
+// chunks, then the pipeline read them in those: every expert a card does not hold streamed twice, Q4 dual 1406 tok/s
+// against 1867 in one chunk)
+bool dp_takes(int64_t n, int64_t cap) { return n >= dp_min_tokens() && dp_step_for(n, cap) >= kDpMinLast; }
+// the layer pipeline's chunk for a segment of n tokens below the DP path: STRATA_PIPE_HALF_MIN..STRATA_PIPE_HALF_MAX
+// (default 2048..0: off) reads a segment of that many tokens in two equal halves on the 256 grid, so both cards stream
+// and compute at once instead of one after the other; the others take STRATA_DP_PIPE_CHUNK.  Which sizes pay depends on
+// the pack (2x RX 7900 XTX, prompt tok/s, one chunk -> halves): Q4_K_XL 4K 1027 -> 1183 but 8K 1867 -> 1406;
+// IQ3 4K 2243 -> 1908 but 8K 2891 -> 3050; IQ4 4K 1637 -> 1573 - so the presets set the range per pack
+int64_t pipe_chunk_for(int64_t n) {
+    static const int64_t half_min = [] { const char* e = std::getenv("STRATA_PIPE_HALF_MIN"); return e ? std::max<int64_t>(2048, std::atoll(e)) : (int64_t) 2048; }();
+    static const int64_t half_max = [] { const char* e = std::getenv("STRATA_PIPE_HALF_MAX"); return e ? std::atoll(e) : (int64_t) 0; }();
+    if (n >= half_min && n <= half_max) return ((n + 1) / 2 + 255) / 256 * 256;
+    return dp_pipe_chunk();
+}
 }  // namespace
 
 namespace {
@@ -13705,8 +13724,8 @@ int main(int argc, char** argv) {
                                  (long long) pipe_chunk, (long long) o.prefill_chunk, (long long) pf_pipe_k);
                 int64_t want_full = equal_chunk(tokens, pipe_chunk);
                 if (dp_on) {   // [claude] DP: a long segment lends the DP plan's step; the layer pipeline keeps its chunk
-                    if (tokens >= dp_min_tokens()) want_full = std::min(o.prefill_chunk, dp_step_for(tokens, o.prefill_chunk));
-                    else want_full = std::min(want_full, dp_pipe_chunk());
+                    if (dp_takes(tokens, o.prefill_chunk)) want_full = std::min(o.prefill_chunk, dp_step_for(tokens, o.prefill_chunk));
+                    else want_full = std::min(want_full, pipe_chunk_for(tokens));
                 }
                 // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
                 const int64_t want = o.prefill_head_alias ? o.prefill_chunk
@@ -13820,7 +13839,7 @@ int main(int argc, char** argv) {
                     return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 8;
                 }();
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
-                if (dp_on && b0 - a0 >= dp_min_tokens()) {
+                if (dp_on && dp_takes(b0 - a0, o.prefill_chunk)) {
                     // [claude] DP: both GPUs on alternating chunks; a head to the next K/V block boundary first (the
                     // pipeline), and the pipeline for a prompt the plan cannot take
                     const int64_t blk = strata::kernels::qsa_real_shapes().idx_block;
@@ -13828,7 +13847,7 @@ int main(int argc, char** argv) {
                     if (head > 0 && !sp.run(ids.data() + a0, head, a0, e)) return false;
                     std::string de;
                     if (strata::prefill::Prefill::run_dp(sp, stages[0]->sp, ids.data() + a0 + head, b0 - a0 - head,
-                                                         a0 + head, o.prefill_chunk, 4224, de))
+                                                         a0 + head, o.prefill_chunk, kDpMinLast, de))
                         return true;
                     if (de.rfind("prefill DP: the p", 0) != 0) { e = de; return false; }
                     std::fprintf(stderr, "strata serve: %s - the layer pipeline reads it\n", de.c_str());
