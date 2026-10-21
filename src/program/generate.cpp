@@ -174,7 +174,18 @@ constexpr int64_t kDpMinLast = 4224;
 // read by the layer pipeline and must lend the pipeline's chunk, not the DP step (8K prompts lent two 4096-token
 // chunks, then the pipeline read them in those: every expert a card does not hold streamed twice, Q4 dual 1406 tok/s
 // against 1867 in one chunk)
-bool dp_takes(int64_t n, int64_t cap) { return n >= dp_min_tokens() && dp_step_for(n, cap) >= kDpMinLast; }
+// (the last chunk is what remains after the full steps: 8441 tokens plan 4352 + 4089, refused)
+bool dp_takes(int64_t n, int64_t cap) {
+    if (n < dp_min_tokens()) return false;
+    const int64_t step = dp_step_for(n, cap);
+    const int64_t full = (n + step - 1) / step;
+    return full >= 2 && n - (full - 1) * step >= kDpMinLast;
+}
+// the head read_part reads on the layer pipeline before DP: up to the next K/V block boundary from a0
+int64_t dp_head(int64_t a0) {
+    const int64_t blk = strata::kernels::qsa_real_shapes().idx_block;
+    return (blk - a0 % blk) % blk;
+}
 // the layer pipeline's chunk for a segment of n tokens below the DP path: STRATA_PIPE_HALF_MIN..STRATA_PIPE_HALF_MAX
 // (default 2048..0: off) reads a segment of that many tokens in two equal halves on the 256 grid, so both cards stream
 // and compute at once instead of one after the other; the others take STRATA_DP_PIPE_CHUNK.  Which sizes pay depends on
@@ -13704,7 +13715,7 @@ int main(int argc, char** argv) {
             // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
-            auto lend = [&](int64_t tokens, std::string& e) -> bool {
+            auto lend = [&](int64_t a0, int64_t tokens, std::string& e) -> bool {
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
@@ -13724,7 +13735,11 @@ int main(int argc, char** argv) {
                                  (long long) pipe_chunk, (long long) o.prefill_chunk, (long long) pf_pipe_k);
                 int64_t want_full = equal_chunk(tokens, pipe_chunk);
                 if (dp_on) {   // [claude] DP: a long segment lends the DP plan's step; the layer pipeline keeps its chunk
-                    if (dp_takes(tokens, o.prefill_chunk)) want_full = std::min(o.prefill_chunk, dp_step_for(tokens, o.prefill_chunk));
+                    // the part DP reads: read_part takes the head to the next K/V block boundary on the pipeline first
+                    // (a segment after the root checkpoint starts inside a block: an 8,448-token prompt left DP 8,191
+                    // tokens, a 4,096 step under kDpMinLast, and the pipeline read it in the lent 4,224-token chunks)
+                    const int64_t dp_n = tokens - dp_head(a0);
+                    if (dp_takes(dp_n, o.prefill_chunk)) want_full = std::min(o.prefill_chunk, dp_step_for(dp_n, o.prefill_chunk));
                     else want_full = std::min(want_full, pipe_chunk_for(tokens));
                 }
                 // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
@@ -13839,11 +13854,10 @@ int main(int argc, char** argv) {
                     return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 8;
                 }();
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
-                if (dp_on && dp_takes(b0 - a0, o.prefill_chunk)) {
+                if (dp_on && dp_takes(b0 - a0 - dp_head(a0), o.prefill_chunk)) {
                     // [claude] DP: both GPUs on alternating chunks; a head to the next K/V block boundary first (the
                     // pipeline), and the pipeline for a prompt the plan cannot take
-                    const int64_t blk = strata::kernels::qsa_real_shapes().idx_block;
-                    const int64_t head = (blk - a0 % blk) % blk;
+                    const int64_t head = dp_head(a0);
                     if (head > 0 && !sp.run(ids.data() + a0, head, a0, e)) return false;
                     std::string de;
                     if (strata::prefill::Prefill::run_dp(sp, stages[0]->sp, ids.data() + a0 + head, b0 - a0 - head,
@@ -14056,7 +14070,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
-                if (!win && !lend(to - at, err)) {
+                if (!win && !lend(at, to - at, err)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;
                 }
