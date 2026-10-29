@@ -2335,7 +2335,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     static const bool ple_trace = std::getenv("STRATA_PLE_TRACE") != nullptr;
     Clock::time_point ple_t0 = t_start;
 
-    for (int64_t c0 = 0; c0 < n; c0 += m.T) {
+    for (int64_t c0 = 0; c0 < n; c0 += step_at(c0)) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(step_at(c0), n - c0), p0 = pos0 + c0;
@@ -4526,7 +4526,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             for (float v : h) { c += !std::isfinite(v); if (std::isfinite(v)) mx = std::max(mx, (double) std::fabs(v)); }
             std::fprintf(stderr, " %lld non-finite (max |x| %.3g)", (long long) c, mx);
         };
-        const int64_t last = (n - 1) % m.T;
+        const int64_t last = (n - 1) < first_step ? (n - 1) : (n - 1 - first_step) % m.T;   // the row in the last chunk (ramp-aware)
         std::fprintf(stderr, "strata dbg: prompt end: last residual row");
         bad(m.R + last * D, D);
         if (PR.ready()) { std::fprintf(stderr, "; PLE history"); bad(PR.hist, (int64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM); }
