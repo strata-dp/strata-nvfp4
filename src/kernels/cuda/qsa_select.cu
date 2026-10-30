@@ -200,7 +200,7 @@ __global__ void __launch_bounds__(128) block_scores_tc_kernel(const float* __res
                                                               const float* __restrict__ q_idx,
                                                               const int32_t* __restrict__ steps, int64_t nq,
                                                               int64_t max_blocks, int64_t reach,
-                                                              float* __restrict__ out) {
+                                                              float* __restrict__ out, int exact) {
     extern __shared__ __align__(16) float sm[];
     float* sQ = sm;                                   // [TC_QT][TC_QS]
     float* sK = sm + TC_QT * TC_QS;                   // [TC_NB][TC_KS]
@@ -255,8 +255,10 @@ __global__ void __launch_bounds__(128) block_scores_tc_kernel(const float* __res
                 al[1] = tf32_hi(x1 - __uint_as_float(ah[1]));
                 al[2] = tf32_hi(x2 - __uint_as_float(ah[2]));
                 al[3] = tf32_hi(x3 - __uint_as_float(ah[3]));
-                mma_tf32(acc[h], al, bh);
-                mma_tf32(acc[h], ah, bl);
+                if (exact) {   // [tune] STRATA_SELECT_TF32=1 skips the two low-part products (1xTF32)
+                    mma_tf32(acc[h], al, bh);
+                    mma_tf32(acc[h], ah, bl);
+                }
                 mma_tf32(acc[h], ah, bh);
             }
         }
@@ -1190,8 +1192,16 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
     const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
     const int64_t per = (int64_t) TC_NB * TC_ITER;
     const dim3 grid((unsigned) ((reach + per - 1) / per), (unsigned) ((nq + TC_QT - 1) / TC_QT));
+    // [tune] STRATA_SELECT_TF32=1: one TF32 product per element (10-bit mantissa) instead of the 3xTF32 split; the
+    // selection can differ at near-ties, so it is opt-in and said once
+    static const int tc_exact = [] {
+        const char* v = std::getenv("STRATA_SELECT_TF32");
+        const bool one = v != nullptr && v[0] == '1';
+        if (one) std::fprintf(stderr, "strata select: STRATA_SELECT_TF32=1 - 1xTF32 block scores (not bitwise with the default)\n");
+        return one ? 0 : 1;
+    }();
     block_scores_tc_kernel<<<grid, 128, bytes, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach,
-                                                                         scores);
+                                                                         scores, tc_exact);
     block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_tc: %s\n", cudaGetErrorString(e)); std::exit(1); }
