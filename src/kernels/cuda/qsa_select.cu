@@ -286,6 +286,238 @@ __global__ void __launch_bounds__(128) block_scores_tc_kernel(const float* __res
     }
 }
 
+// ---- [tune] v2 block scores (2026-10-30, cuda-tune step 2): the SAME MMAs as block_scores_tc_kernel, operand for
+// operand and per accumulator in the same order, so the same bits (harness: 11/11 cases bit-identical); 1.6x faster
+// on sm_86. The CTA's 16 queries are split into TF32 hi/lo A fragments ONCE (shared memory, fragment order) instead
+// of per warp, tile and k-step; 8 warps each stream their own 32-block tiles through a private 4-stage cp.async ring
+// (no CTA barrier in the main loop); one persistent wave of CTAs whose query tiles walk the same key spans together,
+// so a key slice comes from DRAM once and from L2 for the other query tiles. STRATA_QSA_TC_V1=1: the previous kernel.
+constexpr int TCN_Q = TC_QT;                                       // 16 queries per CTA
+constexpr int TCN_WARPS = 8;
+constexpr int TCN_NT = 4;                                          // n8 tiles per warp tile
+constexpr int TCN_WB = TCN_NT * 8;                                 // 32 blocks per warp tile (= v1's TC_NB)
+constexpr int TCN_KSTEPS = IDX_DIM / 8;                            // 16 k-steps
+constexpr int TCN_STAGES = 4;                                      // ring depth (k-steps)
+constexpr int TCN_STAGE_F = TCN_WB * 8;                            // 256 floats = 1 KB per stage
+constexpr int TCN_A_U4 = IDX_HEADS * TCN_KSTEPS * 2 * 32;          // 4,096 uint4 = 64 KB of A fragments
+constexpr int TCN_RING_F = TCN_WARPS * TCN_STAGES * TCN_STAGE_F;   // 8,192 floats = 32 KB of rings
+constexpr int TCN_SMEM_BYTES = TCN_A_U4 * 16 + TCN_RING_F * 4;     // 98,304 dynamic (+ 64 static) <= 99 KB
+static_assert(TCN_WB == TC_NB, "v2's warp tile is v1's tile (same alignment, same written set)");
+static_assert(TCN_RING_F == TCN_Q * IDX_HEADS * IDX_DIM, "the rings double as the raw query staging area");
+static_assert(TCN_KSTEPS % TCN_STAGES == 0, "every warp tile starts on ring stage 0");
+static_assert(TCN_STAGES == 4, "the loop's stage arithmetic (& 3), wait depth (1) and refill distance (3) assume 4");
+static_assert(TCN_Q * IDX_HEADS * IDX_DIM / 4 == 8 * TCN_WARPS * 32, "8 16-byte query chunks per thread");
+
+__device__ __forceinline__ void tcn_cp16(float* smem, const float* gmem, bool full) {   // 16 bytes, or 16 zeros
+#if STRATA_SEL_SM80
+    const unsigned s = (unsigned) __cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(full ? 16 : 0)
+                 : "memory");
+#else
+    *reinterpret_cast<float4*>(smem) = full ? *reinterpret_cast<const float4*>(gmem) : make_float4(0.f, 0.f, 0.f, 0.f);
+#endif
+}
+__device__ __forceinline__ void tcn_commit() {
+#if STRATA_SEL_SM80
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+#endif
+}
+template <int N>
+__device__ __forceinline__ void tcn_wait() {   // at most N of this thread's newest groups still in flight
+#if STRATA_SEL_SM80
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+#endif
+}
+// the same instruction as mma_tf32; A = {a0, a1, a2, a3} as stored in the fragment array
+__device__ __forceinline__ void tcn_mma(float* c, const uint4& a, uint32_t b0, uint32_t b1) {
+#if !STRATA_SEL_SM80
+    __trap();
+#else
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1));
+#endif
+}
+// k-step `st` of this warp's sequence (warp tile st / 16, dims 8 * (st % 16) .. + 7) into one ring stage: 32 rows x
+// two 16-byte halves; the halves are swapped on rows 4..7 of every 8 (conflict-free B-fragment reads). Rows >= hi_nbid
+// (v1's zero padding) and steps past the end are zero-filled, so every call issues and commits exactly one group.
+__device__ __forceinline__ void tcn_issue(float* stage, const float* __restrict__ pooled, int st, int total,
+                                          int64_t gw, int64_t G, int64_t hi_nbid, int lane) {
+    const int i = st >> 4, ks = st & 15;
+    const int64_t bb = (gw + (int64_t) i * G) * TCN_WB;
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+        const int c = lane + 32 * u, r = c >> 1, hh = c & 1;
+        const int64_t b = bb + r;
+        const bool ok = st < total && b < hi_nbid;
+        const float* src = ok ? pooled + b * IDX_DIM + ks * 8 + hh * 4 : pooled;
+        tcn_cp16(stage + r * 8 + ((hh ^ ((r >> 2) & 1)) << 2), src, ok);
+    }
+    tcn_commit();
+}
+
+__global__ void __launch_bounds__(TCN_WARPS * 32, 1) block_scores_tc2_kernel(const float* __restrict__ pooled,
+                                                                           const float* __restrict__ q_idx,
+                                                                           const int32_t* __restrict__ steps,
+                                                                           int64_t nq, int64_t max_blocks,
+                                                                           int64_t reach, float* __restrict__ out) {
+#if !STRATA_SEL_SM80
+    __trap();
+#else
+    extern __shared__ __align__(16) float tcn_sm[];
+    uint4* sA = reinterpret_cast<uint4*>(tcn_sm);   // [head][k-step][hi, lo][lane]: v1's A fragments
+    float* sRing = tcn_sm + TCN_A_U4 * 4;            // [warp][stage][32 rows][8]; first the raw queries [16][512]
+    __shared__ int s_nbid[TCN_Q];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5, gid = lane >> 2, tig = lane & 3;
+    const int64_t q0 = (int64_t) blockIdx.x * TCN_Q;
+    constexpr int QROW = IDX_HEADS * IDX_DIM;        // 512 floats per query
+
+    // 1. the 16 raw query rows into the ring area (rows q >= nq: zeros, as v1's sQ)
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int c = t + i * TCN_WARPS * 32, r = c >> 7, cc = c & 127;   // 128 16-byte chunks per row
+        const bool ok = q0 + r < nq;
+        tcn_cp16(sRing + r * QROW + cc * 4, ok ? q_idx + (q0 + r) * QROW + cc * 4 : q_idx, ok);
+    }
+    tcn_commit();
+    if (t < TCN_Q) s_nbid[t] = q0 + t < nq ? steps[(q0 + t) * kStepCount + kStepNBid] : 0;
+    tcn_wait<0>();
+    __syncthreads();
+
+    // 2. split once: fragment (h, k-step ks, lane gid*4+tig) = rows gid, gid+8 x dims 8ks+tig, 8ks+tig+4 (v1's a0..a3)
+    {
+        const int ksl = lane >> 2;
+#pragma unroll 2
+        for (int i = 0; i < 8; ++i) {
+            const int cb = warp + TCN_WARPS * i;   // 64 = 4 heads x 8 fragment rows x 2 halves of the k-steps
+            const int h = cb >> 4, g = (cb >> 1) & 7, ks = ((cb & 1) << 3) + ksl;
+            const float* rr = sRing + g * QROW + h * IDX_DIM + ks * 8 + tig;
+            const float x0 = rr[0], x1 = rr[8 * QROW], x2 = rr[4], x3 = rr[8 * QROW + 4];
+            uint4 hi, lo;
+            hi.x = tf32_hi(x0); hi.y = tf32_hi(x1); hi.z = tf32_hi(x2); hi.w = tf32_hi(x3);
+            lo.x = tf32_hi(x0 - __uint_as_float(hi.x));
+            lo.y = tf32_hi(x1 - __uint_as_float(hi.y));
+            lo.z = tf32_hi(x2 - __uint_as_float(hi.z));
+            lo.w = tf32_hi(x3 - __uint_as_float(hi.w));
+            uint4* d = sA + h * (TCN_KSTEPS * 64) + ks * 64 + g * 4 + tig;
+            d[0] = hi;
+            d[32] = lo;
+        }
+    }
+    int hi_nbid = 0;
+    for (int i = 0; i < TCN_Q; ++i) {
+        if (q0 + i >= nq) break;
+        hi_nbid = max(hi_nbid, s_nbid[i]);
+    }
+    __syncthreads();   // fragments complete, raw rows read: the warps' rings take the area over
+
+    // 3. this warp's 32-block tiles: j = gw, gw + G, ... while 32 j < min(hi_nbid, reach) (= v1's tile condition)
+    const int64_t lim = (int64_t) hi_nbid < reach ? (int64_t) hi_nbid : reach;
+    const int64_t J = (lim + TCN_WB - 1) / TCN_WB;
+    const int64_t G = (int64_t) gridDim.y * TCN_WARPS;
+    const int64_t gw = (int64_t) blockIdx.y * TCN_WARPS + warp;
+    if (lim <= 0 || gw >= J) return;   // warp-uniform; no CTA barrier follows
+    const int ntile = (int) ((J - 1 - gw) / G + 1);
+    const int total = ntile * TCN_KSTEPS;
+
+    int64_t lim0 = 0, lim1 = 0;        // write limits of rows gid, gid + 8 (0: query >= nq)
+    if (q0 + gid < nq) lim0 = (int64_t) s_nbid[gid] < max_blocks ? (int64_t) s_nbid[gid] : max_blocks;
+    if (q0 + gid + 8 < nq) lim1 = (int64_t) s_nbid[gid + 8] < max_blocks ? (int64_t) s_nbid[gid + 8] : max_blocks;
+    const int sw = (gid >> 2) & 1;     // row gid's half swap in the ring
+    const int off0 = gid * 8 + (sw << 2) + tig, off1 = gid * 8 + ((sw ^ 1) << 2) + tig;   // dims tig, tig + 4
+    float* ring = sRing + warp * (TCN_STAGES * TCN_STAGE_F);
+    const uint4* aw = sA + lane;
+
+    tcn_issue(ring + 0 * TCN_STAGE_F, pooled, 0, total, gw, G, hi_nbid, lane);
+    tcn_issue(ring + 1 * TCN_STAGE_F, pooled, 1, total, gw, G, hi_nbid, lane);
+    tcn_issue(ring + 2 * TCN_STAGE_F, pooled, 2, total, gw, G, hi_nbid, lane);
+    uint32_t bh[TCN_NT][2], bl[TCN_NT][2];   // B fragments of the current k-step (v1's bh / bl per n8 tile)
+    tcn_wait<2>();                            // step 0 landed (own copies) ...
+    __syncwarp();                             // ... and the whole warp's
+#pragma unroll
+    for (int nt = 0; nt < TCN_NT; ++nt) {
+        const float kx0 = ring[nt * 64 + off0], kx1 = ring[nt * 64 + off1];
+        bh[nt][0] = tf32_hi(kx0);
+        bh[nt][1] = tf32_hi(kx1);
+        bl[nt][0] = tf32_hi(kx0 - __uint_as_float(bh[nt][0]));
+        bl[nt][1] = tf32_hi(kx1 - __uint_as_float(bh[nt][1]));
+    }
+
+    float acc[IDX_HEADS][TCN_NT][4];
+    for (int i = 0; i < ntile; ++i) {
+#pragma unroll
+        for (int h = 0; h < IDX_HEADS; ++h)
+#pragma unroll
+            for (int nt = 0; nt < TCN_NT; ++nt) acc[h][nt][0] = acc[h][nt][1] = acc[h][nt][2] = acc[h][nt][3] = 0.f;
+        for (int ks4 = 0; ks4 < TCN_KSTEPS; ks4 += TCN_STAGES) {
+#pragma unroll
+            for (int u = 0; u < TCN_STAGES; ++u) {     // step st = 16 i + ks4 + u lives in stage u
+                const int ks = ks4 + u, st = i * TCN_KSTEPS + ks;
+                // groups committed so far: 3 + st (steps 0 .. st + 2); <= 1 pending => step st + 1 has landed
+                tcn_wait<1>();
+                __syncwarp();
+                float nk[TCN_NT][2];                   // raw keys of step st + 1 (stage u + 1)
+                const float* nx = ring + ((u + 1) & 3) * TCN_STAGE_F;
+#pragma unroll
+                for (int nt = 0; nt < TCN_NT; ++nt) {
+                    nk[nt][0] = nx[nt * 64 + off0];
+                    nk[nt][1] = nx[nt * 64 + off1];
+                }
+                uint4 ah[IDX_HEADS], al[IDX_HEADS];
+#pragma unroll
+                for (int h = 0; h < IDX_HEADS; ++h) {
+                    ah[h] = aw[h * (TCN_KSTEPS * 64) + ks * 64];
+                    al[h] = aw[h * (TCN_KSTEPS * 64) + ks * 64 + 32];
+                }
+                // refill stage u + 3 = the stage of step st - 1, whose reads ended before the previous __syncwarp
+                tcn_issue(ring + ((u + 3) & 3) * TCN_STAGE_F, pooled, st + 3, total, gw, G, hi_nbid, lane);
+                // per accumulator: lo*hi, hi*lo, hi*hi (v1's order); 4 independent chains between dependent MMAs
+#pragma unroll
+                for (int h = 0; h < IDX_HEADS; ++h) {
+#pragma unroll
+                    for (int nt = 0; nt < TCN_NT; ++nt) tcn_mma(acc[h][nt], al[h], bh[nt][0], bh[nt][1]);
+#pragma unroll
+                    for (int nt = 0; nt < TCN_NT; ++nt) tcn_mma(acc[h][nt], ah[h], bl[nt][0], bl[nt][1]);
+#pragma unroll
+                    for (int nt = 0; nt < TCN_NT; ++nt) tcn_mma(acc[h][nt], ah[h], bh[nt][0], bh[nt][1]);
+                }
+#pragma unroll
+                for (int nt = 0; nt < TCN_NT; ++nt) {  // split step st + 1 (v1's arithmetic)
+                    bh[nt][0] = tf32_hi(nk[nt][0]);
+                    bh[nt][1] = tf32_hi(nk[nt][1]);
+                    bl[nt][0] = tf32_hi(nk[nt][0] - __uint_as_float(bh[nt][0]));
+                    bl[nt][1] = tf32_hi(nk[nt][1] - __uint_as_float(bh[nt][1]));
+                }
+            }
+        }
+        // relu per head, heads added in order (as v1), written where the block completed for the query
+        const int64_t bc = (gw + (int64_t) i * G) * TCN_WB + 2 * tig;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int64_t lq = half ? lim1 : lim0;
+            const int64_t qi = q0 + gid + 8 * half;
+#pragma unroll
+            for (int nt = 0; nt < TCN_NT; ++nt)
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    const int64_t b = bc + nt * 8 + j;
+                    if (b >= lq) continue;
+                    float score = 0.0f;
+#pragma unroll
+                    for (int h = 0; h < IDX_HEADS; ++h) {
+                        const float d = acc[h][nt][half * 2 + j];
+                        score += d > 0.0f ? d : 0.0f;
+                    }
+                    __stcs(out + qi * max_blocks + b, score);   // streaming: keep L2 for the shared key slices
+                }
+        }
+    }
+    tcn_wait<0>();   // the trailing (zero-fill) groups, before the warp exits
+#endif
+}
+
+
 #if defined(__HIPCC__)
 // ---- gfx12 (RDNA4: gfx1200 / gfx1201) scorer on v_wmma_f32_16x16x16_bf16 (wave32).  Same GEMM as above: for a tile of 16
 // queries, every block's score is sum over the 4 indexer heads of relu(q_h . k), K = 128.  FP32-level accuracy from a
@@ -1174,6 +1406,50 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
                                                                                     scores);
             const cudaError_t e = cudaGetLastError();
             if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores (simt): %s\n", cudaGetErrorString(e)); std::exit(1); }
+            return true;
+        }
+    }
+    {   // [tune] v2 (the default): the same score bits, 1.6x faster; STRATA_QSA_TC_V1=1 (or STRATA_SELECT_TF32=1): the previous kernel
+        static const bool tc_v1 = [] {
+            const char* v = std::getenv("STRATA_QSA_TC_V1");
+            const char* t = std::getenv("STRATA_SELECT_TF32");
+            const bool one = (v != nullptr && v[0] == '1') || (t != nullptr && t[0] == '1');
+            std::fprintf(stderr, "strata select: block scores kernel %s\n", one ? "v1 (STRATA_QSA_TC_V1 / STRATA_SELECT_TF32)" : "v2");
+            return one;
+        }();
+        if (!tc_v1) {
+            static bool attr2[64] = {};
+            static int n_sm[64] = {};
+            int dev2 = 0;
+            cudaGetDevice(&dev2);
+            if (dev2 < 0 || dev2 >= 64) return false;
+            if (!attr2[dev2]) {
+                if (cudaFuncSetAttribute(block_scores_tc2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         TCN_SMEM_BYTES) != cudaSuccess) {
+                    cudaGetLastError();
+                    return false;
+                }
+                int sms = 0;
+                if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev2) != cudaSuccess || sms < 1) {
+                    cudaGetLastError();
+                    sms = 1;
+                }
+                n_sm[dev2] = sms;
+                attr2[dev2] = true;
+            }
+            const int64_t reach2 = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
+            const int64_t n_qt = (nq + TCN_Q - 1) / TCN_Q;
+            const int64_t spans = ((reach2 + TCN_WB - 1) / TCN_WB + TCN_WARPS - 1) / TCN_WARPS;   // 256-block spans
+            int64_t S = (int64_t) n_sm[dev2] / n_qt;   // one wave: S CTAs per 16-query tile (one CTA per SM, 96 KB)
+            if (S > spans) S = spans;
+            if (S > 65535) S = 65535;
+            if (S < 1) S = 1;
+            const dim3 grid2((unsigned) n_qt, (unsigned) S);   // x = query tile: the tiles of one span run together
+            block_scores_tc2_kernel<<<grid2, TCN_WARPS * 32, TCN_SMEM_BYTES, (cudaStream_t) stream>>>(
+                pooled, q_idx, steps, nq, max_blocks, reach2, scores);
+            block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
+            const cudaError_t e2 = cudaGetLastError();
+            if (e2 != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_tc (v2): %s\n", cudaGetErrorString(e2)); std::exit(1); }
             return true;
         }
     }
